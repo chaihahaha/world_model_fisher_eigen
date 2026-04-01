@@ -77,11 +77,15 @@ class PPOAgent:
     def compute_gradient(self, state, action):
         s = torch.FloatTensor(state).unsqueeze(0)
         a = torch.LongTensor([action])
-        s_ = self.world_model(s, a)
-        ds = torch.mean((s_ - s)**2)
         
-        grad = torch.autograd.grad(ds, a, retain_graph=True)[0]
-        return grad
+        a_emb = self.world_model.embed(a)
+        a_emb.requires_grad_(True)
+        
+        x = torch.cat([s, a_emb], dim=-1)
+        ds = self.world_model.fc2(torch.relu(self.world_model.fc1(x))) - s
+        
+        grad = torch.autograd.grad(ds, a_emb, grad_outputs=torch.ones_like(ds), retain_graph=True)[0]
+        return grad.squeeze(0) if grad is not None else None
     
     def get_min_eigen(self, matrix):
         if matrix is None:
