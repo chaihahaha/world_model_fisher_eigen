@@ -57,7 +57,6 @@ class PPOAgent:
         self.world_model_optimizer = optim.Adam(self.world_model.parameters(), lr=lr)
         
         self.fisher_matrix = None
-        self.param_dim = None
     
     def get_action(self, state):
         logits = self.policy(torch.FloatTensor(state).unsqueeze(0))
@@ -78,21 +77,11 @@ class PPOAgent:
     def compute_gradient(self, state, action):
         s = torch.FloatTensor(state).unsqueeze(0)
         a = torch.LongTensor([action])
-        pred = self.world_model(s, a)
-        v = self.value(pred)
+        s_ = self.world_model(s, a)
+        ds = torch.mean((s_ - s)**2)
         
-        params = list(self.world_model.parameters()) + list(self.value.parameters())
-        
-        if self.param_dim is None:
-            self.param_dim = sum(p.numel() for p in params if p.requires_grad)
-        
-        grads = []
-        for p in params:
-            if p.requires_grad:
-                g = torch.autograd.grad(v, p, retain_graph=True)[0]
-                if g is not None:
-                    grads.append(g.view(-1))
-        return torch.cat(grads) if grads else None
+        grad = torch.autograd.grad(ds, a, retain_graph=True)[0]
+        return grad
     
     def get_min_eigen(self, matrix):
         if matrix is None:
