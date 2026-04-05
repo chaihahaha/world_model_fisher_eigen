@@ -333,15 +333,27 @@ class MPMEQLearningAgent:
         self.memory = deque(maxlen=5000)
         self.batch_size = 32
     
-    def select_action(self, state: np.ndarray, epsilon: float = 0.1) -> int:
+    def select_action(self, state: np.ndarray, epsilon: float = 0.1, use_epsilon_greedy: bool = False) -> int:
         """
-        Select action combining Q-values with MPME exploration.
+        Select action combining Q-values with exploration.
+        
+        Args:
+            state: Current state
+            epsilon: Epsilon for epsilon-greedy
+            use_epsilon_greedy: If True, use epsilon-greedy; if False, use exploration method
         """
         state_tensor = torch.FloatTensor(state).unsqueeze(0)
         
         # Get Q-values
         with torch.no_grad():
             q_values = self.q_network(state_tensor)
+        
+        # Epsilon-greedy mode
+        if use_epsilon_greedy:
+            if np.random.rand() < epsilon:
+                return np.random.randint(self.action_dim)
+            else:
+                return q_values.argmax().item()
         
         # Convert to probabilities (softmax)
         q_probs = F.softmax(q_values / 0.1, dim=-1).numpy()[0]
@@ -398,14 +410,34 @@ def extract_state(state):
     return state.flatten() if hasattr(state, 'flatten') else state
 
 def run_episode(env: gym.Env, agent: MPMEQLearningAgent, 
-               max_steps: int = 500, epsilon: float = 0.1) -> float:
-    """Run one episode."""
+               max_steps: int = 500, epsilon: float = 0.1,
+               use_epsilon_greedy: bool = False, plain_rl: bool = False) -> float:
+    """
+    Run one episode.
+    
+    Args:
+        env: Environment
+        agent: RL agent
+        max_steps: Maximum steps per episode
+        epsilon: Epsilon for exploration
+        use_epsilon_greedy: Use epsilon-greedy exploration
+        plain_rl: Use plain RL (greedy, no exploration)
+    """
     obs, _ = env.reset()
     state = extract_state(obs)
     total_reward = 0
     
     for step in range(max_steps):
-        action = agent.select_action(state, epsilon)
+        if plain_rl:
+            # Plain RL: always greedy
+            action = agent.select_action(state, epsilon=0.0, use_epsilon_greedy=False)
+        elif use_epsilon_greedy:
+            # Epsilon-greedy
+            action = agent.select_action(state, epsilon=epsilon, use_epsilon_greedy=True)
+        else:
+            # MPME or count-based exploration
+            action = agent.select_action(state, epsilon=epsilon, use_epsilon_greedy=False)
+        
         next_obs, reward, terminated, truncated, _ = env.step(action)
         next_state = extract_state(next_obs)
         done = terminated or truncated
@@ -424,16 +456,28 @@ def run_episode(env: gym.Env, agent: MPMEQLearningAgent,
 def train_agent(env: gym.Env, agent: MPMEQLearningAgent, 
                 n_episodes: int, max_steps: int = 500,
                 epsilon_start: float = 0.5, epsilon_end: float = 0.01,
-                print_every: int = 20) -> List[float]:
-    """Train agent for n_episodes."""
+                print_every: int = 20,
+                exploration_type: str = "mpme") -> List[float]:
+    """
+    Train agent for n_episodes.
+    
+    Args:
+        exploration_type: "mpme", "count", "epsilon", or "plain"
+    """
     rewards = []
     
     for ep in range(n_episodes):
         # Decay epsilon
         epsilon = epsilon_end + (epsilon_start - epsilon_end) * max(0, 1 - ep / n_episodes)
         
+        # Determine exploration mode
+        use_epsilon_greedy = (exploration_type == "epsilon")
+        plain_rl = (exploration_type == "plain")
+        
         # Run episode
-        episode_reward = run_episode(env, agent, max_steps, epsilon)
+        episode_reward = run_episode(env, agent, max_steps, epsilon,
+                                     use_epsilon_greedy=use_epsilon_greedy, 
+                                     plain_rl=plain_rl)
         rewards.append(episode_reward)
         
         # Learn multiple times per episode
@@ -442,15 +486,19 @@ def train_agent(env: gym.Env, agent: MPMEQLearningAgent,
         
         if (ep + 1) % print_every == 0:
             avg_r = np.mean(rewards[-print_every:])
-            status = "MPME" if agent.use_mpme else "Count"
-            print(f"  {status}   - Episodes {ep-print_every+2}-{ep+1}: Avg Reward={avg_r:.1f}")
+            status = exploration_type.upper()
+            print(f"  {status:<10} - Episodes {ep-print_every+2}-{ep+1}: Avg Reward={avg_r:.1f}")
     
     return rewards
 
 
 def run_benchmark(env_name: str, n_episodes: int = 200, max_steps: int = 500,
-                  print_every: int = 20) -> Tuple[List[float], List[float]]:
-    """Run benchmark comparing MPME vs count-based exploration."""
+                  print_every: int = 20) -> Dict[str, List[float]]:
+    """
+    Run benchmark comparing all exploration methods.
+    
+    Returns dict with rewards for each method: mpme, count, epsilon, plain
+    """
     print(f"\n{'='*70}")
     print(f"Environment: {env_name}")
     print(f"{'='*70}")
@@ -459,7 +507,7 @@ def run_benchmark(env_name: str, n_episodes: int = 200, max_steps: int = 500,
         env = gym.make(env_name)
     except Exception as e:
         print(f"Error creating environment {env_name}: {e}")
-        return None, None
+        return None
     
     # Get dimensions
     obs_space = env.observation_space
@@ -483,7 +531,10 @@ def run_benchmark(env_name: str, n_episodes: int = 200, max_steps: int = 500,
     
     print(f"State dim: {state_dim}, Action dim: {action_dim}, MiniGrid: {is_minigrid}")
     
-    # MPME agent
+    results = {}
+    
+    # 1. MPME exploration
+    print("\n  Training MPME exploration...")
     agent_mpme = MPMEQLearningAgent(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -491,30 +542,66 @@ def run_benchmark(env_name: str, n_episodes: int = 200, max_steps: int = 500,
         use_mpme=True,
         is_minigrid=is_minigrid
     )
-    
-    mpme_rewards = train_agent(env, agent_mpme, n_episodes, max_steps, print_every=print_every)
+    results['mpme'] = train_agent(env, agent_mpme, n_episodes, max_steps, 
+                                   print_every=print_every, exploration_type="mpme")
     
     # Reset environment
     env.close()
     env = gym.make(env_name)
     
-    # Count-based agent (baseline)
+    # 2. Count-based exploration
+    print("\n  Training count-based exploration...")
     agent_count = MPMEQLearningAgent(
         state_dim=state_dim,
         action_dim=action_dim,
         exploration_weight=0.5,
-        use_mpme=False,  # Use count-based
+        use_mpme=False,
         is_minigrid=is_minigrid
     )
+    results['count'] = train_agent(env, agent_count, n_episodes, max_steps,
+                                    print_every=print_every, exploration_type="count")
     
-    count_rewards = train_agent(env, agent_count, n_episodes, max_steps, print_every=print_every)
+    # Reset environment
+    env.close()
+    env = gym.make(env_name)
+    
+    # 3. Epsilon-greedy exploration
+    print("\n  Training epsilon-greedy exploration...")
+    agent_epsilon = MPMEQLearningAgent(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        exploration_weight=0.5,
+        use_mpme=True,
+        is_minigrid=is_minigrid
+    )
+    results['epsilon'] = train_agent(env, agent_epsilon, n_episodes, max_steps,
+                                      print_every=print_every, exploration_type="epsilon")
+    
+    # Reset environment
+    env.close()
+    env = gym.make(env_name)
+    
+    # 4. Plain RL (greedy, no exploration)
+    print("\n  Training plain RL (no exploration)...")
+    agent_plain = MPMEQLearningAgent(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        exploration_weight=0.0,
+        use_mpme=True,
+        is_minigrid=is_minigrid
+    )
+    results['plain'] = train_agent(env, agent_plain, n_episodes, max_steps,
+                                    print_every=print_every, exploration_type="plain")
     
     env.close()
     
-    print(f"\n  MPME final 20 episodes avg: {np.mean(mpme_rewards[-20:]):.1f}")
-    print(f"  Count final 20 episodes avg: {np.mean(count_rewards[-20:]):.1f}")
+    # Print summary
+    print("\n  Final Results (last 20 episodes):")
+    for method, rewards in results.items():
+        avg = np.mean(rewards[-20:])
+        print(f"    {method.upper():<10}: {avg:.3f}")
     
-    return mpme_rewards, count_rewards
+    return results
 
 
 def main():
@@ -551,29 +638,32 @@ def main():
     results = {}
     
     for env_name, n_eps, max_steps in benchmarks:
-        mpme_r, count_r = run_benchmark(env_name, n_eps, max_steps)
-        if mpme_r is not None:
-            results[env_name] = (mpme_r, count_r)
+        all_rewards = run_benchmark(env_name, n_eps, max_steps)
+        if all_rewards is not None:
+            results[env_name] = all_rewards
     
     # Summary
-    print("\n" + "=" * 75)
+    print("\n" + "=" * 85)
     print("Benchmark Results Summary")
-    print("=" * 75)
-    print(f"{'Environment':<30} {'MPME (last 20)':<16} {'Count (last 20)':<16} {'Improvement':<12}")
-    print("-" * 75)
+    print("=" * 85)
+    print(f"{'Environment':<35} {'MPME':<10} {'Count':<10} {'Epsilon':<10} {'Plain':<10} {'Best':<10}")
+    print("-" * 85)
     
-    for env_name, (mpme_r, count_r) in results.items():
-        mpme_avg = np.mean(mpme_r[-20:])
-        count_avg = np.mean(count_r[-20:])
-        if abs(count_avg) > 1e-6:
-            improvement = ((mpme_avg - count_avg) / abs(count_avg)) * 100
-        else:
-            improvement = 0
-        print(f"{env_name:<30} {mpme_avg:<16.1f} {count_avg:<16.1f} {improvement:+.1f}%")
+    for env_name, all_rewards in results.items():
+        mpme_avg = np.mean(all_rewards['mpme'][-20:])
+        count_avg = np.mean(all_rewards['count'][-20:])
+        epsilon_avg = np.mean(all_rewards['epsilon'][-20:])
+        plain_avg = np.mean(all_rewards['plain'][-20:])
+        
+        # Find best method
+        results_dict = {'MPME': mpme_avg, 'Count': count_avg, 'Epsilon': epsilon_avg, 'Plain': plain_avg}
+        best_method = max(results_dict, key=results_dict.get)
+        
+        print(f"{env_name:<35} {mpme_avg:<10.3f} {count_avg:<10.3f} {epsilon_avg:<10.3f} {plain_avg:<10.3f} {best_method:<10}")
     
-    print("\n" + "=" * 75)
+    print("\n" + "=" * 85)
     print("MPME-RL Exploration Benchmark Complete")
-    print("=" * 75)
+    print("=" * 85)
 
 
 if __name__ == "__main__":
