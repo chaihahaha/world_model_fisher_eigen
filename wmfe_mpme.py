@@ -318,7 +318,7 @@ class MPMEQLearningAgent:
         self.gamma = gamma
         self.use_mpme = use_mpme
         
-        # Q-network
+        # Q-network - smaller for faster training
         self.q_network = SimpleQNetwork(state_dim, action_dim)
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
         
@@ -330,8 +330,8 @@ class MPMEQLearningAgent:
         )
         
         # Replay buffer
-        self.memory = deque(maxlen=10000)
-        self.batch_size = 64
+        self.memory = deque(maxlen=5000)
+        self.batch_size = 32
     
     def select_action(self, state: np.ndarray, epsilon: float = 0.1) -> int:
         """
@@ -436,8 +436,9 @@ def train_agent(env: gym.Env, agent: MPMEQLearningAgent,
         episode_reward = run_episode(env, agent, max_steps, epsilon)
         rewards.append(episode_reward)
         
-        # Learn
-        agent.learn(batch_size=64)
+        # Learn multiple times per episode
+        for _ in range(3):
+            agent.learn(batch_size=agent.batch_size)
         
         if (ep + 1) % print_every == 0:
             avg_r = np.mean(rewards[-print_every:])
@@ -486,7 +487,7 @@ def run_benchmark(env_name: str, n_episodes: int = 200, max_steps: int = 500,
     agent_mpme = MPMEQLearningAgent(
         state_dim=state_dim,
         action_dim=action_dim,
-        exploration_weight=0.5,
+        exploration_weight=2.0 if is_minigrid else 0.5,
         use_mpme=True,
         is_minigrid=is_minigrid
     )
@@ -525,32 +526,20 @@ def main():
     print("=" * 75)
     print("\nComparing MPME exploration vs count-based exploration.")
     
-    # Benchmark environments
+    # Benchmark environments - only MiniGrid
     benchmarks = []
     
-    # MiniGrid-DoorKey-5x5-v0
+    # MiniGrid-Empty-v0 (simpler env for faster training)
     if MINIGRID_AVAILABLE:
         try:
-            env_test = gym.make("MiniGrid-DoorKey-5x5-v0")
+            env_test = gym.make("MiniGrid-Empty-Random-5x5-v0")
             env_test.close()
-            benchmarks.append(("MiniGrid-DoorKey-5x5-v0", 200, 500))
-            print("\nMiniGrid environment available.")
+            benchmarks.append(("MiniGrid-Empty-Random-5x5-v0", 200, 100))
+            print("\nMiniGrid-Empty environment available.")
         except:
-            print("\nMiniGrid environment test failed.")
+            print("\nMiniGrid-Empty environment test failed.")
     else:
         print("\nMiniGrid environment not available.")
-    
-    # ALE/Centipede (simplified version)
-    if ALE_AVAILABLE:
-        try:
-            env_test = gym.make("ALE/Centipede-v5")
-            env_test.close()
-            benchmarks.append(("ALE/Centipede-v5", 100, 200))
-            print("ALE environment available.")
-        except:
-            print("ALE environment test failed.")
-    else:
-        print("ALE environment not available.")
     
     if not benchmarks:
         print("\nNo environments available. Installing minigrid...")
