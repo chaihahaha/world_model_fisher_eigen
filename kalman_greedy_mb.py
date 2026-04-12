@@ -1,24 +1,3 @@
-"""
-Kalman-Greedy Model-Based RL with Active Exploration
-
-KEY INSIGHT: Use Riccati uncertainty for ACTIVE STATE SELECTION,
-not just adding exploration bonuses.
-
-The sensor selection paper chooses WHICH sensors to activate.
-In RL, this means choosing WHICH states to visit.
-
-ALGORITHM:
-1. Learn transition/reward model (like standard model-based RL)
-2. Track uncertainty via Riccati equation (novel)
-3. Use information gain for active state selection (novel)
-4. Plan trajectories that maximize information gain
-
-WHY THIS BEATS BASELINES:
-- Riccati captures directional uncertainty (not scalar counts)
-- Active selection finds informative states efficiently
-- Works well in sparse-reward/hard-exploration tasks
-"""
-
 import numpy as np
 from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
