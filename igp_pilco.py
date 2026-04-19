@@ -246,7 +246,7 @@ class PILCOCore:
 
     def __init__(self, state_dim: int, action_dim: int, horizon: int = 20,
                  discount: float = 0.99, cost_target: Optional[np.ndarray] = None,
-                 cost_width: float = 1.0):
+                 cost_width: float = 1.0, gp_fit_interval: int = 5):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.horizon = horizon
@@ -254,6 +254,8 @@ class PILCOCore:
         self.cost_target = cost_target if cost_target is not None else np.zeros(state_dim)
         self.cost_width = cost_width
         self.cost_matrix = np.eye(state_dim)
+        self.gp_fit_interval = gp_fit_interval
+        self._transitions_since_fit = 0
 
         # Dynamics model: one GP per state dimension
         self.gp_dynamics: List[GaussianProcessRegressor] = []
@@ -265,8 +267,16 @@ class PILCOCore:
         self.dataset_X: Optional[np.ndarray] = None
         self.dataset_deltas: Optional[np.ndarray] = None
 
+    def _fit_gps(self, optimize_hyperparams: bool = False):
+        """Fit all dynamics GPs to current dataset."""
+        if self.dataset_X is None or self.dataset_X.shape[0] < 2:
+            return
+        for d in range(self.state_dim):
+            self.gp_dynamics[d].fit(self.dataset_X, self.dataset_deltas[:, d],
+                                    optimize_hyperparams=optimize_hyperparams)
+
     def add_transition(self, states: np.ndarray, actions: np.ndarray, next_states: np.ndarray):
-        """Add a batch of transitions to the dataset."""
+        """Add a batch of transitions to the dataset (no auto-fit)."""
         X = np.column_stack([states, actions])
         deltas = next_states - states
         if self.dataset_X is None:
@@ -275,10 +285,6 @@ class PILCOCore:
         else:
             self.dataset_X = np.vstack([self.dataset_X, X])
             self.dataset_deltas = np.vstack([self.dataset_deltas, deltas])
-
-        # Re-fit each GP
-        for d in range(self.state_dim):
-            self.gp_dynamics[d].fit(self.dataset_X, self.dataset_deltas[:, d])
 
     def add_single_transition(self, state: np.ndarray, action: np.ndarray, next_state: np.ndarray):
         """Add a single transition."""
@@ -774,8 +780,13 @@ class IGP_PILCO:
             next_states_arr = np.array(next_states_list)
             self.pilco.add_transition(states_arr, actions_arr, next_states_arr)
 
+            # Fit GPs at end of each episode (no hyperparam optimization during training)
+            self.pilco._fit_gps(optimize_hyperparams=False)
+
             # Optimize policy periodically
             if episode % evaluate_every == 0:
+                # Fit with hyperparam optimization for better policy evaluation
+                self.pilco._fit_gps(optimize_hyperparams=True)
                 self.pilco.optimize_policy(mu0, Sigma0, n_iter=policy_n_iter)
 
                 # Evaluate
