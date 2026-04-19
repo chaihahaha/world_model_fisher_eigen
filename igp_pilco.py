@@ -267,20 +267,50 @@ class PILCOCore:
         self.policy = PILCOPolicy(state_dim, action_dim)
         self.dataset_X: Optional[np.ndarray] = None
         self.dataset_deltas: Optional[np.ndarray] = None
+        self._X_mean: Optional[np.ndarray] = None
+        self._X_std: Optional[np.ndarray] = None
+        self._Y_mean: Optional[np.ndarray] = None
+        self._Y_std: Optional[np.ndarray] = None
 
     def _fit_gps(self, optimize_hyperparams: bool = False, use_subset: bool = False):
-        """Fit all dynamics GPs to current dataset."""
+        """Fit all dynamics GPs to current dataset with input normalization."""
         if self.dataset_X is None or self.dataset_X.shape[0] < 2:
             return
-        X = self.dataset_X
-        Y = self.dataset_deltas
-        if use_subset and X.shape[0] > self.max_gp_samples:
-            idx = np.random.choice(X.shape[0], self.max_gp_samples, replace=False)
-            X = X[idx]
-            Y = Y[idx]
+        X = self.dataset_X.copy()
+        Y = self.dataset_deltas.copy()
+
+        # Normalize inputs for stable GP training
+        if self._X_mean is None:
+            self._X_mean = X.mean(axis=0)
+            self._X_std = X.std(axis=0)
+            self._X_std[self._X_std < 1e-6] = 1.0
+            self._Y_mean = Y.mean(axis=0)
+            self._Y_std = Y.std(axis=0)
+            self._Y_std[self._Y_std < 1e-6] = 1.0
+
+        X_norm = (X - self._X_mean) / self._X_std
+        Y_norm = (Y - self._Y_mean) / self._Y_std
+
+        if use_subset and X_norm.shape[0] > self.max_gp_samples:
+            idx = np.random.choice(X_norm.shape[0], self.max_gp_samples, replace=False)
+            X_norm = X_norm[idx]
+            Y_norm = Y_norm[idx]
+
         for d in range(self.state_dim):
-            self.gp_dynamics[d].fit(X, Y[:, d],
+            self.gp_dynamics[d].fit(X_norm, Y_norm[:, d],
                                     optimize_hyperparams=optimize_hyperparams)
+
+    def _normalize_state_action(self, mu: np.ndarray, Sigma: np.ndarray):
+        """Normalize state-action inputs for GP prediction."""
+        mu_norm = (mu - self._X_mean) / self._X_std
+        Sigma_norm = Sigma / (self._X_std[:, np.newaxis] * self._X_std[np.newaxis, :])
+        return mu_norm, Sigma_norm
+
+    def _denormalize_delta(self, mu_delta: np.ndarray, Sigma_delta: np.ndarray):
+        """Denormalize GP predictions back to original space."""
+        mu_delta_orig = mu_delta * self._Y_std
+        Sigma_delta_orig = Sigma_delta * (self._Y_std[:, np.newaxis] * self._Y_std[np.newaxis, :])
+        return mu_delta_orig, Sigma_delta_orig
 
     def add_transition(self, states: np.ndarray, actions: np.ndarray, next_states: np.ndarray):
         """Add a batch of transitions to the dataset (no auto-fit)."""
@@ -402,12 +432,17 @@ class PILCOCore:
         return Q
 
     def predict_distribution(self, mu: np.ndarray, Sigma: np.ndarray,
-                             policy: PILCOPolicy) -> Tuple[np.ndarray, np.ndarray]:
+                              policy: PILCOPolicy) -> Tuple[np.ndarray, np.ndarray]:
         """
         One-step distribution prediction via moment matching.
         Input: state distribution N(mu, Sigma)
         Output: next state distribution N(mu_next, Sigma_next)
+
+        Uses input normalization for stable GP predictions.
         """
+        if self._X_mean is None:
+            return mu.copy(), Sigma.copy()
+
         # Compute control distribution moments
         u_mean = policy.apply(mu.reshape(-1, self.state_dim)).mean(axis=0)
         # du/dx = K for linear policy u = Kx + b
@@ -427,19 +462,22 @@ class PILCOCore:
         Sigma_joint[n_x:, :n_x] = Sigma_joint[:n_x, n_x:].T
         Sigma_joint[n_x:, n_x:] = Sigma_u
 
+        # Normalize for GP prediction
+        mu_joint_norm, Sigma_joint_norm = self._normalize_state_action(mu_joint, Sigma_joint)
+
         mu_delta = np.zeros(self.state_dim)
         Sigma_delta = np.zeros((self.state_dim, self.state_dim))
 
         for d in range(self.state_dim):
             gp = self.gp_dynamics[d]
 
-            # Compute q vector - pass as single test point (1, dim)
-            mu_joint_single = mu_joint.reshape(1, -1)
-            q = self._compute_q(mu_joint_single, Sigma_joint, gp)  # shape (n_train, 1)
+            # Compute q vector - pass as single test point (1, dim) in normalized space
+            mu_joint_single = mu_joint_norm.reshape(1, -1)
+            q = self._compute_q(mu_joint_single, Sigma_joint_norm, gp)  # shape (n_train, 1)
             mu_delta[d] = q.flatten() @ gp._alpha[:, 0]
 
-            # Compute Q matrix for covariance
-            Q_mat = self._compute_Q_matrix(mu_joint, Sigma_joint, gp, gp)
+            # Compute Q matrix for covariance in normalized space
+            Q_mat = self._compute_Q_matrix(mu_joint_norm, Sigma_joint_norm, gp, gp)
             expected_var_d = gp.signal_var - np.trace(Q_mat) / gp.n
 
             # Clamp expected variance to be non-negative (PILCO approximation artifact)
