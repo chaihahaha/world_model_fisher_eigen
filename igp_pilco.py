@@ -93,9 +93,8 @@ class GaussianProcessRegressor:
             signal_var = np.exp(2 * log_signal)
             noise_var = np.exp(2 * log_noise)
 
-            if np.any(lengthscales < 1e-6) or np.any(lengthscales > 100):
-                return 1e10
-
+            # Clamp lengthscales to reasonable range for numerical stability
+            lengthscales = np.clip(lengthscales, 0.1, 20.0)
             self.lengthscales = lengthscales
             self.signal_var = signal_var
             self.noise_var = noise_var
@@ -125,7 +124,7 @@ class GaussianProcessRegressor:
                          options={'maxiter': 100, 'ftol': 1e-6})
 
         if result.fun < neg_marginal_log_likelihood(x0):
-            self.lengthscales = np.exp(result.x[:self.dim])
+            self.lengthscales = np.clip(np.exp(result.x[:self.dim]), 0.1, 20.0)
             self.signal_var = np.exp(2 * result.x[self.dim])
             self.noise_var = np.exp(2 * result.x[self.dim + 1])
 
@@ -246,7 +245,8 @@ class PILCOCore:
 
     def __init__(self, state_dim: int, action_dim: int, horizon: int = 20,
                  discount: float = 0.99, cost_target: Optional[np.ndarray] = None,
-                 cost_width: float = 1.0, gp_fit_interval: int = 5):
+                 cost_width: float = 1.0, gp_fit_interval: int = 5,
+                 max_gp_samples: int = 30):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.horizon = horizon
@@ -256,6 +256,7 @@ class PILCOCore:
         self.cost_matrix = np.eye(state_dim)
         self.gp_fit_interval = gp_fit_interval
         self._transitions_since_fit = 0
+        self.max_gp_samples = max_gp_samples
 
         # Dynamics model: one GP per state dimension
         self.gp_dynamics: List[GaussianProcessRegressor] = []
@@ -267,12 +268,18 @@ class PILCOCore:
         self.dataset_X: Optional[np.ndarray] = None
         self.dataset_deltas: Optional[np.ndarray] = None
 
-    def _fit_gps(self, optimize_hyperparams: bool = False):
+    def _fit_gps(self, optimize_hyperparams: bool = False, use_subset: bool = False):
         """Fit all dynamics GPs to current dataset."""
         if self.dataset_X is None or self.dataset_X.shape[0] < 2:
             return
+        X = self.dataset_X
+        Y = self.dataset_deltas
+        if use_subset and X.shape[0] > self.max_gp_samples:
+            idx = np.random.choice(X.shape[0], self.max_gp_samples, replace=False)
+            X = X[idx]
+            Y = Y[idx]
         for d in range(self.state_dim):
-            self.gp_dynamics[d].fit(self.dataset_X, self.dataset_deltas[:, d],
+            self.gp_dynamics[d].fit(X, Y[:, d],
                                     optimize_hyperparams=optimize_hyperparams)
 
     def add_transition(self, states: np.ndarray, actions: np.ndarray, next_states: np.ndarray):
@@ -294,22 +301,50 @@ class PILCOCore:
         """
         Compute q vector for moment matching (Eq. 15 in PILCO paper).
         q_i = integral of k(x_i, x) * N(x | mu, Sigma) dx
+
+        Uses log-space computation to avoid numerical underflow
+        when lengthscales are large relative to Sigma.
         """
         n_train = gp.n
-        n_test = mu_input.shape[0]
+
+        # Normalize mu_input to (n_test, d) format
+        mu_1d = mu_input.reshape(-1, gp.dim) if mu_input.ndim == 1 else mu_input
+        n_test = mu_1d.shape[0]
         q = np.zeros((n_train, n_test))
 
-        for i in range(n_train):
-            nu = gp.X[i] - mu_input  # (d,)
-            # Compute the normalization term
-            Sigma_eff = Sigma_input + gp.lengthscales.reshape(1, -1) ** 2
-            det_ratio = np.sqrt(np.linalg.det(Sigma_input) / np.linalg.det(Sigma_eff))
-            # Exponent term
-            diff = nu.reshape(1, -1)  # (1, d)
+        # Effective covariance (same for all i)
+        Sigma_eff = Sigma_input + np.diag(gp.lengthscales ** 2)
+        Sigma_eff += 1e-8 * np.eye(Sigma_eff.shape[0])
+
+        # Precompute log(det_ratio) for numerical stability
+        try:
+            log_det_sigma_input = np.linalg.slogdet(Sigma_input)[1]
+            log_det_sigma_eff = np.linalg.slogdet(Sigma_eff)[1]
+            log_det_ratio = 0.5 * (log_det_sigma_input - log_det_sigma_eff)
+        except Exception:
+            log_det_ratio = -500.0  # very negative = near-zero ratio
+
+        # Precompute inverse for quadratic form
+        try:
             inv_Sigma_eff = np.linalg.inv(Sigma_eff)
-            exponents = -0.5 * np.sum(diff @ inv_Sigma_eff * diff, axis=1)
-            q[i, :] = (gp.signal_var * det_ratio *
-                        np.exp(exponents - 0.5 * nu @ inv_Sigma_eff @ nu.T))
+        except np.linalg.LinAlgError:
+            return q
+
+        for i in range(n_train):
+            nu = gp.X[i] - mu_1d  # (n_test, d)
+
+            # Quadratic form: sum_j sum_k nu_j * inv_{jk} * nu_k  -> shape (n_test,)
+            quad = np.sum((nu @ inv_Sigma_eff) * nu, axis=1)
+
+            # Compute in log space to avoid underflow:
+            # q = signal_var * det_ratio * exp(-0.5 * quad)
+            # log(q) = log(signal_var) + log(det_ratio) - 0.5 * quad
+            log_q = np.log(max(gp.signal_var, 1e-300)) + log_det_ratio - 0.5 * quad
+
+            # Clamp to avoid exp overflow/underflow
+            log_q = np.clip(log_q, -500, 50)
+            q[i, :] = np.exp(log_q)
+
         return q
 
     def _compute_Q_matrix(self, mu_input: np.ndarray, Sigma_input: np.ndarray,
@@ -317,38 +352,53 @@ class PILCOCore:
         """
         Compute Q matrix for covariance prediction (Eq. 22 in PILCO paper).
         Uses element-wise inverse for diagonal lengthscales.
+        Vectorized implementation with log-space for numerical stability.
         """
         n_train = gp_a.n
-        Q = np.zeros((n_train, n_train))
         d = gp_a.dim
 
         inv_ls_a2 = 1.0 / (gp_a.lengthscales ** 2)  # (d,)
         inv_ls_b2 = 1.0 / (gp_b.lengthscales ** 2)  # (d,)
 
-        for i in range(n_train):
-            for j in range(n_train):
-                nu_i = gp_a.X[i] - mu_input  # (d,)
-                nu_j = gp_b.X[j] - mu_input
+        # Compute effective covariance (same for all i,j pairs)
+        Sigma_eff = Sigma_input + 0.5 * np.diag(1.0 / inv_ls_a2 + 1.0 / inv_ls_b2)
 
-                # Effective covariance: Sigma + 0.5 * diag(1/inv_ls_a2 + 1/inv_ls_b2)
-                Sigma_eff = Sigma_input + 0.5 * np.diag(1.0 / inv_ls_a2 + 1.0 / inv_ls_b2)
-                try:
-                    det_ratio = np.sqrt(max(np.linalg.det(Sigma_input), 1e-300) /
-                                        max(np.linalg.det(Sigma_eff), 1e-300))
-                except np.linalg.LinAlgError:
-                    det_ratio = 0.0
+        # Use log-space determinant for numerical stability
+        try:
+            log_det_sigma_input = np.linalg.slogdet(Sigma_input)[1]
+            log_det_sigma_eff = np.linalg.slogdet(Sigma_eff)[1]
+            log_det_ratio = 0.5 * (log_det_sigma_input - log_det_sigma_eff)
+        except Exception:
+            return np.zeros((n_train, n_train))
 
-                # Quadratic forms with diagonal inverse lengthscales
-                nu_i_quad = np.sum(nu_i ** 2 * inv_ls_a2)
-                nu_j_quad = np.sum(nu_j ** 2 * inv_ls_b2)
+        # All nu_i, nu_j: (n_train, d)
+        mu_1d = mu_input.reshape(-1) if mu_input.ndim == 1 else mu_input
+        nu_all_a = gp_a.X - mu_1d  # (n_train, d)
+        nu_all_b = gp_b.X - mu_1d  # (n_train, d)
 
-                # z_ij term for cross-covariance
-                z = inv_ls_a2 * nu_i + inv_ls_b2 * nu_j  # (d,)
+        # Quadratic forms: (n_train,)
+        nu_i_quad = np.sum(nu_all_a ** 2 * inv_ls_a2, axis=1)
+        nu_j_quad = np.sum(nu_all_b ** 2 * inv_ls_b2, axis=1)
 
-                # Full exponent from PILCO Eq. 22
-                exponent = 0.5 * (z @ Sigma_input @ z) - 0.5 * (nu_i_quad + nu_j_quad)
+        # z matrix: (n_train, n_train, d)
+        nu_i_exp = nu_all_a[:, np.newaxis, :]  # (n_train, 1, d)
+        nu_j_exp = nu_all_b[np.newaxis, :, :]  # (1, n_train, d)
+        z = inv_ls_a2[np.newaxis, np.newaxis, :] * nu_i_exp + inv_ls_b2[np.newaxis, np.newaxis, :] * nu_j_exp  # (n_train, n_train, d)
 
-                Q[i, j] = gp_a.signal_var * gp_b.signal_var * det_ratio * np.exp(exponent)
+        # z @ Sigma_input @ z^T for each pair: (n_train, n_train)
+        z_flat = z.reshape(-1, d)  # (n_train^2, d)
+        z_sigma = (z_flat @ Sigma_input)  # (n_train^2, d)
+        z_sigma_zT = np.sum(z_sigma * z_flat, axis=1).reshape(n_train, n_train)  # (n_train, n_train)
+
+        # Compute in log-space to avoid underflow:
+        # log(Q) = log(signal_var_a) + log(signal_var_b) + log_det_ratio + 0.5*z_sigma_zT - 0.5*(nu_i_quad + nu_j_quad)
+        log_signal_sum = np.log(max(gp_a.signal_var, 1e-300)) + np.log(max(gp_b.signal_var, 1e-300))
+        log_exponent = 0.5 * z_sigma_zT - 0.5 * (nu_i_quad[:, np.newaxis] + nu_j_quad[np.newaxis, :])
+        log_Q = log_signal_sum + log_det_ratio + log_exponent
+
+        # Clamp and exponentiate
+        log_Q = np.clip(log_Q, -500, 50)
+        Q = np.exp(log_Q)
         return Q
 
     def predict_distribution(self, mu: np.ndarray, Sigma: np.ndarray,
@@ -392,15 +442,25 @@ class PILCOCore:
             Q_mat = self._compute_Q_matrix(mu_joint, Sigma_joint, gp, gp)
             expected_var_d = gp.signal_var - np.trace(Q_mat) / gp.n
 
+            # Clamp expected variance to be non-negative (PILCO approximation artifact)
+            expected_var_d = max(expected_var_d, 1e-6)
+
             # Variance of mean
-            var_of_mean = np.sum(q ** 2) / gp.n - q.mean() ** 2
+            var_of_mean = max(np.sum(q ** 2) / gp.n - q.mean() ** 2, 0.0)
             # Scale by alpha^2
             var_of_mean *= gp.signal_var ** 2
 
             Sigma_delta[d, d] = expected_var_d + var_of_mean
 
         mu_next = mu + mu_delta
+
+        # Ensure Sigma_next is positive semi-definite by clamping diagonal
         Sigma_next = Sigma + Sigma_delta
+        Sigma_next = (Sigma_next + Sigma_next.T) / 2  # symmetrize
+        diag_vals = np.diag(Sigma_next)
+        diag_vals = np.maximum(diag_vals, 1e-6)
+        Sigma_next = Sigma_next - np.diag(np.diag(Sigma_next)) + np.diag(diag_vals)
+
         return mu_next, Sigma_next
 
     def expected_cost(self, mu: np.ndarray, Sigma: np.ndarray) -> float:
@@ -785,8 +845,8 @@ class IGP_PILCO:
 
             # Optimize policy periodically
             if episode % evaluate_every == 0:
-                # Fit with hyperparam optimization for better policy evaluation
-                self.pilco._fit_gps(optimize_hyperparams=True)
+                # Fit with hyperparam optimization using subset for speed
+                self.pilco._fit_gps(optimize_hyperparams=True, use_subset=True)
                 self.pilco.optimize_policy(mu0, Sigma0, n_iter=policy_n_iter)
 
                 # Evaluate
