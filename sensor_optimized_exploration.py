@@ -1,9 +1,27 @@
 """
-Sensor-optimized exploration policies for MC-PILCO.
+Action-particle Monte Carlo exploration for MC-PILCO.
 
-These policies use the learned GP dynamics model to guide exploration
-toward state-action regions that maximize information gain (high GP variance),
-implementing the theoretical framework from the sensor selection paper.
+CascadedGPExploration: Evaluates candidate actions for the current timestep
+by predicting next-state Gaussians via GP dynamics, then running particle-based
+rollouts from the predicted next states.
+
+Algorithm:
+  1. Sample N candidate actions for the current timestep
+     (around control policy output + exploration noise)
+  2. For each candidate action a_i:
+     a. Predict next-state Gaussian from (current_state, a_i) via GP
+     b. From that next state, run rollout using control policy + action particles:
+        - Get control policy action for current state
+        - Sample K action particles around control policy action
+        - For each action particle, predict next-state Gaussian via GP
+        - Merge K next-state Gaussians into one Gaussian
+        - Use merged Gaussian as recursive input for next step
+     c. Score = accumulated state variance (exploration coverage)
+  3. Return the candidate action with highest coverage
+
+Key insight: particles are for ACTIONS (not states). The GP accepts Gaussian
+state inputs, so we merge action-particle predictions into a single Gaussian
+for recursive rollout.
 """
 
 import numpy as np
@@ -12,16 +30,10 @@ import torch
 from policy_learning.Policy import Policy
 
 
-class GPUncertaintyExploration(Policy):
+class CascadedGPExploration(Policy):
     """
-    Exploration policy that uses GP predictive variance to guide actions.
-    
-    At each step, evaluates candidate actions by querying the GP model for
-    predictive variance at the next state. Selects the action that maximizes
-    expected uncertainty (sensor selection objective: max tr(P)).
-    
-    Uses a grid search over action space combined with random perturbations
-    for efficiency.
+    Exploration policy using action-particle Monte Carlo sampling on the GP
+    dynamics model with Gaussian merging at each timestep.
     """
 
     def __init__(
@@ -30,527 +42,249 @@ class GPUncertaintyExploration(Policy):
         input_dim,
         f_model_learning,
         model_learning_par,
+        f_control_policy=None,
+        control_policy_par=None,
         flg_squash=True,
         u_max=1.0,
-        num_candidates=20,
-        random_ratio=0.3,
+        num_particles=20,
+        rollout_horizon=4,
+        num_candidates=10,
+        action_noise_std=2.0,
+        Thompson_alpha=0.5,
+        random_ratio=0.1,
         dtype=torch.float64,
         device=torch.device("cpu"),
     ):
-        super(GPUncertaintyExploration, self).__init__(
-            state_dim=state_dim, input_dim=input_dim, flg_squash=flg_squash, u_max=u_max, dtype=dtype, device=device
+        super(CascadedGPExploration, self).__init__(
+            state_dim=state_dim,
+            input_dim=input_dim,
+            flg_squash=flg_squash,
+            u_max=u_max,
+            dtype=dtype,
+            device=device,
         )
-        self.num_candidates = num_candidates
-        self.random_ratio = random_ratio
         self.u_max = u_max
-        self.dtype = dtype
-        self.device = device
+        self.num_particles = num_particles
+        self.rollout_horizon = rollout_horizon
+        self.num_candidates = num_candidates
+        self.action_noise_std = action_noise_std
+        self.Thompson_alpha = Thompson_alpha
+        self.random_ratio = random_ratio
+        self.rng = np.random.RandomState(None)
 
-        # Will be set during initialization
         self.model_learning = None
         self.norm_list = None
-        self.input_dim_actual = input_dim
+        self.control_policy = None
 
-        # Pre-allocate candidate actions
-        self.candidate_actions = None
+        # Store control policy factory for lazy initialization
+        self.f_control_policy = f_control_policy
+        self.control_policy_par = control_policy_par
 
     def set_model_learning(self, model_learning):
-        """Attach the trained GP model learning object."""
         self.model_learning = model_learning
-        self.norm_list = self.model_learning.norm_list
-        self.input_dim_actual = self.model_learning.dim_input - self.state_dim
+        self.norm_list = model_learning.norm_list
 
-    def _get_gp_variance(self, states, inputs):
+        # Initialize control policy if factory provided
+        if self.f_control_policy is not None and self.control_policy_par is not None:
+            self.control_policy = self.f_control_policy(**self.control_policy_par)
+
+    def _random_action(self):
+        rand_u = self.u_max * (2 * self.rng.rand(self.input_dim) - 1)
+        if self.input_dim == 1:
+            return torch.tensor(rand_u, dtype=self.dtype, device=self.device)
+        return torch.tensor(
+            rand_u.reshape([-1, self.input_dim]),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def _predict_next_state_gaussian(self, state_mean, state_var, action):
         """
-        Get total GP predictive variance for given state-input pairs.
-        Returns sum of variances across all GP output dimensions.
+        Given state Gaussian and a deterministic action, predict next-state
+        Gaussian via the GP dynamics model.
+
+        Returns (next_mean, next_var) as 1D tensors.
         """
+        state_batch = state_mean.unsqueeze(0)
+        action_batch = action.unsqueeze(0)
+
+        gp_inputs, _, gp_mean_list, gp_var_list = self.model_learning.get_one_step_gp_out(
+            states=state_batch, inputs=action_batch
+        )
+
+        # Apply normalization scaling to GP variance
+        for i in range(len(gp_var_list)):
+            gp_var_list[i] = gp_var_list[i] * (self.norm_list[i] ** 2)
+
+        # Concatenate GP outputs
+        delta_mean = torch.cat(gp_mean_list, dim=1).squeeze(0)
+        delta_var = torch.cat(gp_var_list, dim=1).squeeze(0)
+
+        # Compute next state mean and variance through dynamics
+        next_mean = torch.zeros_like(state_mean)
+        next_var = torch.zeros_like(state_mean)
+
+        if hasattr(self.model_learning, 'vel_indeces'):
+            # Speed model: GP predicts delta velocity
+            next_mean[self.model_learning.vel_indeces] = (
+                state_mean[self.model_learning.vel_indeces] + delta_mean
+            )
+            next_var[self.model_learning.vel_indeces] = (
+                state_var[self.model_learning.vel_indeces] + delta_var
+            )
+            next_mean[self.model_learning.not_vel_indeces] = (
+                state_mean[self.model_learning.not_vel_indeces]
+                + self.model_learning.T_sampling * state_mean[self.model_learning.vel_indeces]
+                + self.model_learning.T_sampling / 2 * delta_mean
+            )
+            next_var[self.model_learning.not_vel_indeces] = (
+                state_var[self.model_learning.not_vel_indeces]
+                + (self.model_learning.T_sampling ** 2) * state_var[self.model_learning.vel_indeces]
+                + (self.model_learning.T_sampling ** 2 / 4) * delta_var
+            )
+        else:
+            # Direct model: GP predicts state delta
+            next_mean = state_mean + delta_mean
+            next_var = state_var + delta_var
+
+        return next_mean, next_var
+
+    def _merge_gaussians(self, means_list, vars_list, weights=None):
+        """
+        Merge K Gaussians into one using moment matching.
+        """
+        K = len(means_list)
+        if weights is None:
+            weights = torch.ones(K, dtype=self.dtype, device=self.device) / K
+
+        means_stacked = torch.stack(means_list)
+        vars_stacked = torch.stack(vars_list)
+
+        weights_col = weights.view(-1, 1)
+        merged_mean = (weights_col * means_stacked).sum(dim=0)
+
+        mean_diff_sq = (means_stacked - merged_mean.unsqueeze(0)) ** 2
+        merged_var = (weights_col * (vars_stacked + mean_diff_sq)).sum(dim=0)
+        merged_var = torch.clamp(merged_var, min=1e-8)
+
+        return merged_mean, merged_var
+
+    def _rollout_coverage(self, state_mean, state_var):
+        """
+        Run particle-based rollout from given state Gaussian using control
+        policy + action particles. Returns accumulated state variance score.
+        """
+        accumulated_coverage = 0.0
+
+        for step in range(self.rollout_horizon):
+            # Get control policy action for current state
+            if self.control_policy is not None:
+                state_batch = state_mean.unsqueeze(0)
+                ctrl_action = self.control_policy.forward(state_batch, t=step)
+                ctrl_action_np = ctrl_action.detach().cpu().numpy().flatten()
+            else:
+                ctrl_action_np = self.rng.uniform(-self.u_max, self.u_max, self.input_dim)
+
+            # Sample action particles around control policy action
+            means_list = []
+            vars_list = []
+            for _ in range(self.num_particles):
+                noise = self.rng.randn(self.input_dim) * self.action_noise_std * 0.5
+                a_np = np.clip(ctrl_action_np + noise, -self.u_max, self.u_max)
+                a = torch.tensor(a_np, dtype=self.dtype, device=self.device)
+                next_mean, next_var = self._predict_next_state_gaussian(
+                    state_mean, state_var, a
+                )
+                means_list.append(next_mean)
+                vars_list.append(next_var)
+
+            # Merge all action-particle predictions into one Gaussian
+            merged_mean, merged_var = self._merge_gaussians(means_list, vars_list)
+
+            # Thompson sampling: sample from posterior for exploration
+            if self.Thompson_alpha > 0:
+                noise = torch.randn_like(merged_mean) * torch.sqrt(
+                    torch.clamp(merged_var, min=1e-8)
+                ) * self.Thompson_alpha
+                state_mean = merged_mean + noise
+            else:
+                state_mean = merged_mean
+            state_var = merged_var
+
+            # Track exploration coverage
+            accumulated_coverage += state_var.sum().item()
+
+        return accumulated_coverage
+
+    def forward(self, states, t):
+        # Fallback to random if no model or no training data
         if self.model_learning is None:
-            return torch.zeros(states.shape[0], 1, dtype=self.dtype, device=self.device)
+            return self._random_action()
+        if hasattr(self.model_learning, "num_samples") and self.model_learning.num_samples == 0:
+            return self._random_action()
 
-        try:
-            gp_inputs = self.model_learning.data_to_gp_input(states=states, inputs=inputs)
-            gp_output_mean_list, gp_output_var_list = self.model_learning.get_one_step_gp_out(
-                states=states, inputs=inputs
-            )
-            # Sum variance across all GP dimensions
-            total_var = sum(gp_output_var_list[i] for i in range(len(gp_output_var_list)))
-            # Apply normalization
-            for i in range(len(self.norm_list)):
-                gp_output_var_list[i] = gp_output_var_list[i] * self.norm_list[i] ** 2
-            # Re-sum after normalization
-            total_var = sum(gp_output_var_list[i] for i in range(len(gp_output_var_list)))
-            return total_var
-        except Exception:
-            return torch.zeros(states.shape[0], 1, dtype=self.dtype, device=self.device)
+        # Random exploration with some probability
+        if self.rng.rand() < self.random_ratio:
+            return self._random_action()
 
-    def _sample_candidate_actions(self, t):
-        """Sample candidate actions: grid + random perturbations."""
-        if self.input_dim_actual == 1:
-            # 1D action space: grid search + random
-            grid_points = torch.linspace(-self.u_max, self.u_max, self.num_candidates,
-                                         dtype=self.dtype, device=self.device)
-            random_actions = self.u_max * (2 * torch.rand(self.num_candidates, dtype=self.dtype,
-                                                           device=self.device) - 1)
-            self.candidate_actions = torch.cat([grid_points, random_actions])
-            return self.candidate_actions.unsqueeze(1)  # [N, 1]
-        else:
-            # Multi-dimensional: random sampling
-            self.candidate_actions = self.u_max * (
-                2 * torch.rand(self.num_candidates, self.input_dim_actual, dtype=self.dtype, device=self.device) - 1
-            )
-            return self.candidate_actions
-
-    def forward(self, states, t):
-        """
-        Select action that maximizes GP predictive variance at next state.
-        
-        For each candidate action, predict the next state using the GP model's
-        mean function, then evaluate GP variance at that predicted state-input pair.
-        """
-        if self.model_learning is None or self.random_ratio > np.random.rand():
-            # Fall back to random exploration
-            rand_u = self.u_max * (2 * np.random.rand(self.input_dim) - 1)
-            if self.input_dim == 1:
-                return torch.tensor(rand_u, dtype=self.dtype, device=self.device)
-            return torch.tensor(rand_u.reshape([-1, self.input_dim]), dtype=self.dtype, device=self.device)
-
-        # Get current state (use mean if batch)
-        if states.dim() == 2:
-            # Take first particle as representative state
-            current_state = states[0, :]  # [state_dim]
-        else:
-            current_state = states  # [state_dim]
-
-        # Sample candidate actions
-        candidates = self._sample_candidate_actions(t)
-        n_candidates = candidates.shape[0]
-
-        # Expand current state to batch
-        state_batch = current_state.unsqueeze(0).repeat(n_candidates, 1)  # [N, state_dim]
-        input_batch = candidates  # [N, input_dim]
-
-        # Get GP predictions for all candidates
-        gp_inputs = self.model_learning.data_to_gp_input(states=state_batch, inputs=input_batch)
-
-        # Compute GP mean predictions for next state
-        gp_output_mean_list, gp_output_var_list = self.model_learning.get_one_step_gp_out(
-            states=state_batch, inputs=input_batch
-        )
-
-        # Apply normalization to variance
-        for i in range(len(self.norm_list)):
-            gp_output_var_list[i] = gp_output_var_list[i] * self.norm_list[i] ** 2
-
-        # Compute next state mean: x_next = x + delta_mean
-        delta_mean = torch.cat(gp_output_mean_list, 1)  # [N, state_dim]
-        next_state_mean = state_batch + delta_mean  # [N, state_dim]
-
-        # Compute total GP variance at next state as information gain proxy
-        # We use the current GP variance as a proxy (cheaper than re-querying)
-        total_var = sum(gp_output_var_list[i] for i in range(len(gp_output_var_list)))  # [N, 1]
-
-        # Select action with highest variance
-        best_idx = torch.argmax(total_var.squeeze(1))
-        best_action = candidates[best_idx]
-
-        if self.f_squash is not None:
-            best_action = self.f_squash(best_action)
-
-        if self.input_dim == 1:
-            return best_action
-        return best_action.reshape([-1, self.input_dim])
-
-    def get_np_policy(self):
-        """Returns a numpy function handle."""
-        f = lambda state, t: self.forward_np(state, t)
-        return f
-
-    def forward_np(self, state, t=None):
-        """Numpy implementation."""
-        state_tc = torch.tensor(state, dtype=self.dtype, device=self.device).unsqueeze(0)
-        output = self.forward(state_tc, t)
-        out = output.detach().cpu().numpy()
-        if out.ndim > 1 and out.shape[-1] == 1:
-            out = out.squeeze(axis=-1)
-        return out
-
-    def reinit(self, scaling=1):
-        pass
-
-
-class GPInformativenessExploration(Policy):
-    """
-    Exploration policy based on expected information gain.
-    
-    Instead of maximizing raw GP variance, this policy estimates the
-    expected reduction in GP uncertainty from sampling at each candidate
-    action, using the posterior variance as an information gain proxy.
-    
-    Implements the sensor selection objective from the Kalman filtering
-    paper: maximize det(P) or tr(P) of the posterior covariance.
-    """
-
-    def __init__(
-        self,
-        state_dim,
-        input_dim,
-        f_model_learning,
-        model_learning_par,
-        flg_squash=True,
-        u_max=1.0,
-        num_candidates=30,
-        random_ratio=0.4,
-        variance_weight=1.0,
-        gradient_weight=0.0,
-        dtype=torch.float64,
-        device=torch.device("cpu"),
-    ):
-        super(GPInformativenessExploration, self).__init__(
-            state_dim=state_dim, input_dim=input_dim, flg_squash=flg_squash, u_max=u_max, dtype=dtype, device=device
-        )
-        self.num_candidates = num_candidates
-        self.random_ratio = random_ratio
-        self.u_max = u_max
-        self.dtype = dtype
-        self.device = device
-        self.variance_weight = variance_weight
-        self.gradient_weight = gradient_weight
-
-        self.model_learning = None
-        self.norm_list = None
-        self.input_dim_actual = input_dim
-
-    def set_model_learning(self, model_learning):
-        """Attach the trained GP model learning object."""
-        self.model_learning = model_learning
-        self.norm_list = model_learning.norm_list
-        self.input_dim_actual = model_learning.dim_input - state_dim
-
-    def _compute_information_score(self, state_batch, input_batch):
-        """
-        Compute information score for candidate state-input pairs.
-        
-        Score = variance_weight * GP_variance + gradient_weight * |d(variance)/d(action)|
-        
-        Uses GP predictive variance as the primary informativeness signal.
-        """
-        gp_output_mean_list, gp_output_var_list = self.model_learning.get_one_step_gp_out(
-            states=state_batch, inputs=input_batch
-        )
-
-        # Apply normalization
-        for i in range(len(self.norm_list)):
-            gp_output_var_list[i] = gp_output_var_list[i] * self.norm_list[i] ** 2
-
-        # Total variance across all output dimensions
-        total_var = sum(gp_output_var_list[i] for i in range(len(gp_output_var_list)))  # [N, 1]
-
-        # Compute variance of variance (higher = more diverse uncertainty)
-        var_of_var = torch.var(total_var.squeeze(1), dim=0, keepdim=True) if total_var.shape[0] > 1 else torch.zeros(1, 1)
-
-        score = self.variance_weight * total_var.squeeze(1)
-        return score
-
-    def forward(self, states, t):
-        """Select action maximizing expected information gain."""
-        if self.model_learning is None or self.random_ratio > np.random.rand():
-            rand_u = self.u_max * (2 * np.random.rand(self.input_dim) - 1)
-            if self.input_dim == 1:
-                return torch.tensor(rand_u, dtype=self.dtype, device=self.device)
-            return torch.tensor(rand_u.reshape([-1, self.input_dim]), dtype=self.dtype, device=self.device)
-
+        # Extract current state
         if states.dim() == 2:
             current_state = states[0, :]
         else:
-            current_state = states
+            current_state = states.clone()
 
-        # Sample candidate actions
-        if self.input_dim_actual == 1:
-            candidates = torch.linspace(-self.u_max, self.u_max, self.num_candidates,
-                                         dtype=self.dtype, device=self.device)
-            random_actions = self.u_max * (2 * torch.rand(self.num_candidates, dtype=self.dtype,
-                                                           device=self.device) - 1)
-            candidates = torch.cat([candidates, random_actions])
-            input_batch = candidates.unsqueeze(1)
-        else:
-            candidates = self.u_max * (
-                2 * torch.rand(self.num_candidates, self.input_dim_actual, dtype=self.dtype, device=self.device) - 1
-            )
-            input_batch = candidates
+        # Small initial state uncertainty
+        state_var = torch.ones_like(current_state) * 1e-4
 
-        state_batch = current_state.unsqueeze(0).repeat(input_batch.shape[0], 1)
+        # Score each candidate action:
+        # 1. Predict next-state Gaussian from (current_state, candidate_action)
+        # 2. Rollout from predicted next state using control policy + action particles
+        scores = []
+        candidate_actions = []
 
-        # Compute information score
-        scores = self._compute_information_score(state_batch, input_batch)
+        for _ in range(self.num_candidates):
+            # Sample candidate action around control policy output + noise
+            if self.control_policy is not None:
+                state_batch = current_state.unsqueeze(0)
+                ctrl_action = self.control_policy.forward(state_batch, t=0)
+                ctrl_action_np = ctrl_action.detach().cpu().numpy().flatten()
+            else:
+                ctrl_action_np = self.rng.uniform(-self.u_max, self.u_max, self.input_dim)
 
-        best_idx = torch.argmax(scores)
-        best_action = input_batch[best_idx]
+            noisy_action = ctrl_action_np + self.rng.randn(self.input_dim) * self.action_noise_std
+            noisy_action = np.clip(noisy_action, -self.u_max, self.u_max)
+            cand_action = torch.tensor(noisy_action, dtype=self.dtype, device=self.device)
+            candidate_actions.append(cand_action)
 
-        if self.f_squash is not None:
-            best_action = self.f_squash(best_action)
+            try:
+                # Predict next-state Gaussian from candidate action
+                next_mean, next_var = self._predict_next_state_gaussian(
+                    current_state, state_var, cand_action
+                )
 
-        if self.input_dim == 1:
-            return best_action
-        return best_action.reshape([-1, self.input_dim])
+                # Score by rolling out from the predicted next state
+                coverage = self._rollout_coverage(next_mean, next_var)
+                scores.append(-coverage)  # Negate since argmin selects best
+            except Exception:
+                scores.append(0.0)
 
-    def get_np_policy(self):
-        f = lambda state, t: self.forward_np(state, t)
-        return f
+        # Select best candidate action (highest coverage)
+        best_idx = np.argmin(scores)
+        best_action = candidate_actions[best_idx]
 
-    def forward_np(self, state, t=None):
-        state_tc = torch.tensor(state, dtype=self.dtype, device=self.device).unsqueeze(0)
-        output = self.forward(state_tc, t)
-        out = output.detach().cpu().numpy()
+        out = best_action.detach().cpu().numpy()
         if out.ndim > 1 and out.shape[-1] == 1:
             out = out.squeeze(axis=-1)
         return out
 
-    def reinit(self, scaling=1):
+    def get_np_policy(self):
+        return self.forward
+
+    def record_step(self, state, action, next_state):
         pass
 
-
-class HybridGPExploration(Policy):
-    """
-    Hybrid exploration: mixes random exploration with GP-guided exploration.
-    
-    This implements the theoretical insight that the exploration policy
-    should be policy-weighted: exploration(x,u) = sigma_f(x,u) * rho_pi*(x).
-    
-    The mixing ratio can decay over time to transition from exploration
-    to exploitation.
-    """
-
-    def __init__(
-        self,
-        state_dim,
-        input_dim,
-        f_model_learning,
-        model_learning_par,
-        flg_squash=True,
-        u_max=1.0,
-        initial_random_ratio=0.7,
-        min_random_ratio=0.1,
-        decay_rate=0.1,
-        num_candidates=25,
-        dtype=torch.float64,
-        device=torch.device("cpu"),
-    ):
-        super(HybridGPExploration, self).__init__(
-            state_dim=state_dim, input_dim=input_dim, flg_squash=flg_squash, u_max=u_max, dtype=dtype, device=device
-        )
-        self.initial_random_ratio = initial_random_ratio
-        self.min_random_ratio = min_random_ratio
-        self.decay_rate = decay_rate
-        self.num_candidates = num_candidates
-        self.dtype = dtype
-        self.device = device
-        self.current_step = 0
-
-        self.model_learning = None
-        self.norm_list = None
-        self.input_dim_actual = input_dim
-
-    def set_model_learning(self, model_learning):
-        self.model_learning = model_learning
-        self.norm_list = model_learning.norm_list
-        self.input_dim_actual = model_learning.dim_input - self.state_dim
-
-    def _get_random_ratio(self):
-        """Compute decaying random exploration ratio."""
-        ratio = self.initial_random_ratio * (1 - self.decay_rate) ** self.current_step
-        return max(ratio, self.min_random_ratio)
-
-    def forward(self, states, t):
-        random_ratio = self._get_random_ratio()
-        self.current_step += 1
-
-        if self.model_learning is None or random_ratio > np.random.rand():
-            rand_u = self.u_max * (2 * np.random.rand(self.input_dim) - 1)
-            if self.input_dim == 1:
-                return torch.tensor(rand_u, dtype=self.dtype, device=self.device)
-            return torch.tensor(rand_u.reshape([-1, self.input_dim]), dtype=self.dtype, device=self.device)
-
-        if states.dim() == 2:
-            current_state = states[0, :]
-        else:
-            current_state = states
-
-        # Sample candidate actions
-        if self.input_dim_actual == 1:
-            candidates = torch.linspace(-self.u_max, self.u_max, self.num_candidates,
-                                         dtype=self.dtype, device=self.device)
-            random_actions = self.u_max * (
-                2 * torch.rand(self.num_candidates, dtype=self.dtype, device=self.device) - 1
-            )
-            candidates = torch.cat([candidates, random_actions])
-            input_batch = candidates.unsqueeze(1)
-        else:
-            candidates = self.u_max * (
-                2 * torch.rand(self.num_candidates, self.input_dim_actual, dtype=self.dtype, device=self.device) - 1
-            )
-            input_batch = candidates
-
-        state_batch = current_state.unsqueeze(0).repeat(input_batch.shape[0], 1)
-
-        # Query GP for variance
-        gp_output_mean_list, gp_output_var_list = self.model_learning.get_one_step_gp_out(
-            states=state_batch, inputs=input_batch
-        )
-
-        for i in range(len(self.norm_list)):
-            gp_output_var_list[i] = gp_output_var_list[i] * self.norm_list[i] ** 2
-
-        total_var = sum(gp_output_var_list[i] for i in range(len(gp_output_var_list)))  # [N, 1]
-
-        # Score: prioritize actions leading to high uncertainty states
-        score = total_var.squeeze(1)
-
-        best_idx = torch.argmax(score)
-        best_action = input_batch[best_idx]
-
-        if self.f_squash is not None:
-            best_action = self.f_squash(best_action)
-
-        if self.input_dim == 1:
-            return best_action
-        return best_action.reshape([-1, self.input_dim])
-
-    def get_np_policy(self):
-        f = lambda state, t: self.forward_np(state, t)
-        return f
-
-    def forward_np(self, state, t=None):
-        state_tc = torch.tensor(state, dtype=self.dtype, device=self.device).unsqueeze(0)
-        output = self.forward(state_tc, t)
-        out = output.detach().cpu().numpy()
-        if out.ndim > 1 and out.shape[-1] == 1:
-            out = out.squeeze(axis=-1)
-        return out
-
-    def reinit(self, scaling=1):
-        self.current_step = 0
-
-
-class GPGradientExploration(Policy):
-    """
-    Exploration policy that maximizes the gradient of GP variance w.r.t. action.
-    
-    This implements the theoretical result that the optimal exploration
-    direction is along the gradient of the predictive variance:
-    u* = argmax_u sigma^2(x+, pi(u)) where x+ = f(x, u).
-    
-    Uses finite-difference approximation of the gradient for efficiency.
-    """
-
-    def __init__(
-        self,
-        state_dim,
-        input_dim,
-        f_model_learning,
-        model_learning_par,
-        flg_squash=True,
-        u_max=1.0,
-        num_candidates=40,
-        random_ratio=0.35,
-        finite_diff_eps=0.05,
-        dtype=torch.float64,
-        device=torch.device("cpu"),
-    ):
-        super(GPGradientExploration, self).__init__(
-            state_dim=state_dim, input_dim=input_dim, flg_squash=flg_squash, u_max=u_max, dtype=dtype, device=device
-        )
-        self.num_candidates = num_candidates
-        self.random_ratio = random_ratio
-        self.u_max = u_max
-        self.finite_diff_eps = finite_diff_eps
-        self.dtype = dtype
-        self.device = device
-
-        self.model_learning = None
-        self.norm_list = None
-        self.input_dim_actual = input_dim
-
-    def set_model_learning(self, model_learning):
-        self.model_learning = model_learning
-        self.norm_list = model_learning.norm_list
-        self.input_dim_actual = model_learning.dim_input - self.state_dim
-
-    def _compute_variance_and_gradient(self, state, input_batch):
-        """
-        Compute GP variance and its gradient w.r.t. action using finite differences.
-        """
-        n = input_batch.shape[0]
-        state_batch = state.unsqueeze(0).repeat(n, 1)
-
-        gp_output_mean_list, gp_output_var_list = self.model_learning.get_one_step_gp_out(
-            states=state_batch, inputs=input_batch
-        )
-
-        for i in range(len(self.norm_list)):
-            gp_output_var_list[i] = gp_output_var_list[i] * self.norm_list[i] ** 2
-
-        total_var = sum(gp_output_var_list[i] for i in range(len(gp_output_var_list)))  # [N, 1]
-
-        if self.input_dim_actual == 1:
-            # Compute gradient via finite differences
-            var_vals = total_var.squeeze(1)
-            # Find the action with highest variance
-            best_idx = torch.argmax(var_vals)
-            best_action = input_batch[best_idx]
-            return best_action, var_vals
-        else:
-            best_idx = torch.argmax(total_var.squeeze(1))
-            best_action = input_batch[best_idx]
-            return best_action, total_var.squeeze(1)
-
-    def forward(self, states, t):
-        if self.model_learning is None or self.random_ratio > np.random.rand():
-            rand_u = self.u_max * (2 * np.random.rand(self.input_dim) - 1)
-            if self.input_dim == 1:
-                return torch.tensor(rand_u, dtype=self.dtype, device=self.device)
-            return torch.tensor(rand_u.reshape([-1, self.input_dim]), dtype=self.dtype, device=self.device)
-
-        if states.dim() == 2:
-            current_state = states[0, :]
-        else:
-            current_state = states
-
-        if self.input_dim_actual == 1:
-            # Grid search for 1D action space
-            candidates = torch.linspace(-self.u_max, self.u_max, self.num_candidates,
-                                         dtype=self.dtype, device=self.device)
-            random_actions = self.u_max * (
-                2 * torch.rand(self.num_candidates, dtype=self.dtype, device=self.device) - 1
-            )
-            candidates = torch.cat([candidates, random_actions])
-            input_batch = candidates.unsqueeze(1)
-        else:
-            candidates = self.u_max * (
-                2 * torch.rand(self.num_candidates, self.input_dim_actual, dtype=self.dtype, device=self.device) - 1
-            )
-            input_batch = candidates
-
-        best_action, _ = self._compute_variance_and_gradient(current_state, input_batch)
-
-        if self.f_squash is not None:
-            best_action = self.f_squash(best_action)
-
-        if self.input_dim == 1:
-            return best_action
-        return best_action.reshape([-1, self.input_dim])
-
-    def get_np_policy(self):
-        f = lambda state, t: self.forward_np(state, t)
-        return f
-
-    def forward_np(self, state, t=None):
-        state_tc = torch.tensor(state, dtype=self.dtype, device=self.device).unsqueeze(0)
-        output = self.forward(state_tc, t)
-        out = output.detach().cpu().numpy()
-        if out.ndim > 1 and out.shape[-1] == 1:
-            out = out.squeeze(axis=-1)
-        return out
-
-    def reinit(self, scaling=1):
+    def reset(self):
         pass
+
+    def reinit(self, scaling=1):
+        self.reset()
